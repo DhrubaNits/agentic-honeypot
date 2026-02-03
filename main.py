@@ -1,13 +1,13 @@
 import os
 import re
 import asyncio
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 
 import requests
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
-APP = FastAPI(title="Agentic HoneyPot API", version="0.2.0")
+APP = FastAPI(title="Agentic HoneyPot API", version="0.3.0")
 
 API_KEY = os.getenv("HONEYPOT_API_KEY", "")
 GUVI_CALLBACK_URL = "https://hackathon.guvi.in/api/updateHoneyPotFinalResult"
@@ -19,7 +19,8 @@ SESSION_LOCK = asyncio.Lock()
 class Message(BaseModel):
     sender: str
     text: str
-    timestamp: str
+    # Hackathon guideline says epoch ms; accept both int and str to be robust
+    timestamp: Union[int, str]
 
 class Metadata(BaseModel):
     channel: Optional[str] = None
@@ -35,12 +36,16 @@ class HoneyPotRequest(BaseModel):
 class HoneyPotResponse(BaseModel):
     status: str
     reply: str
+    # Optional extra fields (keeps compatibility with expected minimal output)
+    scamDetected: Optional[bool] = None
+    totalMessagesExchanged: Optional[int] = None
+    extractedIntelligence: Optional[Dict[str, Any]] = None
 
 # ----------- Regex -----------
 UPI_REGEX = re.compile(r"\b[a-zA-Z0-9.\-_]{2,}@[a-zA-Z]{2,}\b")
 URL_REGEX = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 PHONE_REGEX = re.compile(r"\b(\+91[\s-]?)?[6-9]\d{9}\b")
-BANK_REGEX = re.compile(r"\b\d{9,18}\b")   # could catch amounts too, but ok for hackathon
+BANK_REGEX = re.compile(r"\b\d{9,18}\b")   # may catch non-accounts; ok for hackathon MVP
 IFSC_REGEX = re.compile(r"\b[A-Z]{4}0[A-Z0-9]{6}\b", re.IGNORECASE)
 
 KEYWORDS = [
@@ -77,7 +82,7 @@ def extract_intel(text: str) -> Dict[str, List[str]]:
         "ifscCodes": list(set(IFSC_REGEX.findall(text))),
     }
 
-# ----------- Agent (stage-based, avoids repetition) -----------
+# ----------- Agent (stage-based) -----------
 def next_agent_reply(session: Dict[str, Any], last_msg: str) -> str:
     t = last_msg.lower()
     intel = session["intel"]
@@ -92,19 +97,25 @@ def next_agent_reply(session: Dict[str, Any], last_msg: str) -> str:
     # Safety: never share OTP / never pay
     if "otp" in t:
         return (
-            ask_once("otp_refuse", "I can’t share OTP. Please provide an official bank support number or a complaint/ticket reference.")
+            ask_once(
+                "otp_refuse",
+                "I can’t share OTP. Please provide an official bank support number or a complaint/ticket reference."
+            )
             or "Please share the official support number/ticket reference."
         )
 
-    if any(x in t for x in ["pay", "send ₹", "send rs", "transfer", "debit", "payment"]):
+    if any(x in t for x in ["pay", "send ₹", "send rs", "transfer", "debit", "payment", "frozen", "freeze"]):
         # Stall + extract details without paying
         return (
-            ask_once("pay_stall", "I can do it, but I need the beneficiary name shown on the payment request and the exact reason/message. What does it display?")
+            ask_once(
+                "pay_stall",
+                "I can do it, but I need the beneficiary name shown on the payment request and the exact reason/message. What does it display?"
+            )
             or "What beneficiary name shows on the payment request?"
         )
 
-    # If link is present but not fully extracted, ask for full link / domain
-    if URL_REGEX.search(last_msg) and not intel["phishingLinks"]:
+    # Ask for full link if we still don't have any link recorded (progressive extraction)
+    if ("link" in t or URL_REGEX.search(last_msg)) and not session["intel"]["phishingLinks"]:
         return (
             ask_once("full_link", "Please paste the full link here exactly as received (including https://).")
             or "Please paste the full link exactly as received."
@@ -129,24 +140,21 @@ def next_agent_reply(session: Dict[str, Any], last_msg: str) -> str:
 
     # Stage: collect payment identifiers (UPI, beneficiary, IFSC, account)
     if stage == "collect_payment":
-        # If no UPI yet, ask for it (but only once)
         if not intel["upiIds"]:
             q = ask_once("ask_upi", "What’s the UPI ID / handle you want me to use? Please send it exactly (like name@bank).")
             if q:
                 return q
 
-        # If UPI exists but no beneficiary name asked yet, ask for name
-        q = ask_once("beneficiary_name", "What is the beneficiary/merchant name that will appear when I enter that UPI?")
+        # Ask beneficiary name once
+        q = ask_once("beneficiary_name", "What beneficiary name shows on the payment request?")
         if q:
             return q
 
-        # If no link asked yet, ask for official payment page link
-        if not intel["phishingLinks"]:
+        if not session["intel"]["phishingLinks"]:
             q = ask_once("payment_link", "Is there an official payment/verification link from the bank? Please paste it here.")
             if q:
                 return q
 
-        # Ask for bank account + IFSC only if they try alternate payment route
         q = ask_once("acct_ifsc", "If UPI fails, do you have a bank account + IFSC option? Share the account number + IFSC.")
         if q:
             return q
@@ -156,7 +164,6 @@ def next_agent_reply(session: Dict[str, Any], last_msg: str) -> str:
 
     # Stage: stall & extend (keep them engaged without exposing)
     if stage == "stall_and_extend":
-        # Rotate among a few believable stalling questions
         for key, text in [
             ("doc_needed", "Before I proceed, can you send the exact SMS/email text you received from the bank (word to word)?"),
             ("time_window", "By what time exactly will it be blocked? I’m currently not near my banking app."),
@@ -167,24 +174,28 @@ def next_agent_reply(session: Dict[str, Any], last_msg: str) -> str:
             if q:
                 return q
 
-        # Fallback
         return "Okay, please share the official link and beneficiary details again so I can verify properly."
 
-    # Default fallback (should not hit often)
     return "Can you share the official reference number and the exact steps again?"
 
 # ----------- Finalization -----------
 def should_finalize(session: Dict[str, Any]) -> bool:
     intel = session["intel"]
 
-    has_any = (
-        bool(intel["upiIds"]) or bool(intel["phishingLinks"]) or bool(intel["phoneNumbers"]) or bool(intel["bankAccounts"]) or bool(intel["ifscCodes"])
-    )
+    # Require at least 2 categories of intel for better scoring (reduces early finalize)
+    categories = 0
+    if intel["upiIds"]:
+        categories += 1
+    if intel["phishingLinks"]:
+        categories += 1
+    if intel["phoneNumbers"]:
+        categories += 1
+    if intel["bankAccounts"] or intel["ifscCodes"]:
+        categories += 1
 
-    # Finalize after enough engagement or enough intel
     if session["total_messages"] >= 18:
         return True
-    if has_any and session["total_messages"] >= 8:
+    if categories >= 2 and session["total_messages"] >= 10:
         return True
     return False
 
@@ -206,7 +217,10 @@ def send_callback(session_id: str, session: Dict[str, Any]) -> None:
         "scamDetected": True,
         "totalMessagesExchanged": session["total_messages"],
         "extractedIntelligence": extracted,
-        "agentNotes": session.get("notes", "Urgency + verification scam pattern. Agent engaged to extract payment identifiers and links."),
+        "agentNotes": session.get(
+            "notes",
+            "Urgency + verification scam pattern. Agent engaged to extract payment identifiers and links."
+        ),
     }
 
     try:
@@ -265,16 +279,40 @@ async def honeypot(req: HoneyPotRequest, x_api_key: str = Header(default="")):
         if not session["scam"]:
             reply = "Sorry, I didn’t understand. Can you explain what you need?"
             session["total_messages"] += 1
-            return HoneyPotResponse(status="success", reply=reply)
+            return HoneyPotResponse(
+                status="success",
+                reply=reply,
+                scamDetected=False,
+                totalMessagesExchanged=session["total_messages"],
+                extractedIntelligence={
+                    "bankAccounts": session["intel"]["bankAccounts"],
+                    "upiIds": session["intel"]["upiIds"],
+                    "phishingLinks": session["intel"]["phishingLinks"],
+                    "phoneNumbers": session["intel"]["phoneNumbers"],
+                    "suspiciousKeywords": session["keywords"],
+                },
+            )
 
-        # Agent reply (stateful)
+        # Agent reply
         reply = next_agent_reply(session, req.message.text)
 
         # Count outgoing agent message
         session["total_messages"] += 1
 
-        # Callback if done
+        # Final callback if done
         if should_finalize(session):
             send_callback(req.sessionId, session)
 
-    return HoneyPotResponse(status="success", reply=reply)
+        return HoneyPotResponse(
+            status="success",
+            reply=reply,
+            scamDetected=True,
+            totalMessagesExchanged=session["total_messages"],
+            extractedIntelligence={
+                "bankAccounts": session["intel"]["bankAccounts"],
+                "upiIds": session["intel"]["upiIds"],
+                "phishingLinks": session["intel"]["phishingLinks"],
+                "phoneNumbers": session["intel"]["phoneNumbers"],
+                "suspiciousKeywords": session["keywords"],
+            },
+        )
