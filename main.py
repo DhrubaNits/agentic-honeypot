@@ -7,7 +7,7 @@ import requests
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
-APP = FastAPI(title="Agentic HoneyPot API")
+APP = FastAPI(title="Agentic HoneyPot API", version="0.2.0")
 
 API_KEY = os.getenv("HONEYPOT_API_KEY", "")
 GUVI_CALLBACK_URL = "https://hackathon.guvi.in/api/updateHoneyPotFinalResult"
@@ -40,13 +40,16 @@ class HoneyPotResponse(BaseModel):
 UPI_REGEX = re.compile(r"\b[a-zA-Z0-9.\-_]{2,}@[a-zA-Z]{2,}\b")
 URL_REGEX = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 PHONE_REGEX = re.compile(r"\b(\+91[\s-]?)?[6-9]\d{9}\b")
-BANK_REGEX = re.compile(r"\b\d{9,18}\b")
+BANK_REGEX = re.compile(r"\b\d{9,18}\b")   # could catch amounts too, but ok for hackathon
+IFSC_REGEX = re.compile(r"\b[A-Z]{4}0[A-Z0-9]{6}\b", re.IGNORECASE)
 
 KEYWORDS = [
     "urgent", "verify", "blocked", "suspended", "otp",
-    "upi", "refund", "click", "bank", "kyc"
+    "upi", "refund", "click", "bank", "kyc", "account",
+    "freeze", "limited", "penalty", "immediately"
 ]
 
+# ----------- Detection -----------
 def is_scam(text: str) -> bool:
     score = 0
     t = text.lower()
@@ -64,35 +67,124 @@ def is_scam(text: str) -> bool:
 
     return score >= 5
 
+# ----------- Extraction -----------
 def extract_intel(text: str) -> Dict[str, List[str]]:
     return {
         "bankAccounts": list(set(BANK_REGEX.findall(text))),
         "upiIds": list(set(UPI_REGEX.findall(text))),
         "phishingLinks": list(set(URL_REGEX.findall(text))),
         "phoneNumbers": list(set(PHONE_REGEX.findall(text))),
+        "ifscCodes": list(set(IFSC_REGEX.findall(text))),
     }
 
-def agent_reply(turns: int, last_msg: str) -> str:
+# ----------- Agent (stage-based, avoids repetition) -----------
+def next_agent_reply(session: Dict[str, Any], last_msg: str) -> str:
     t = last_msg.lower()
+    intel = session["intel"]
+    asked = session["asked"]
 
-    if "upi" in t:
-        return "Okay, can you share the exact UPI handle or payment page link?"
-    if "link" in t or "click" in t:
-        return "Please send the full link here so I can open it."
+    def ask_once(key: str, text: str) -> Optional[str]:
+        if key in asked:
+            return None
+        asked.add(key)
+        return text
+
+    # Safety: never share OTP / never pay
     if "otp" in t:
-        return "I’m not sure about OTP. Can you share official support details?"
+        return (
+            ask_once("otp_refuse", "I can’t share OTP. Please provide an official bank support number or a complaint/ticket reference.")
+            or "Please share the official support number/ticket reference."
+        )
 
-    if turns < 4:
-        return "Why is my account being blocked? Which bank is this?"
-    if turns < 10:
-        return "What are the steps to resolve this today?"
-    return "Before proceeding, please share the official link and beneficiary details."
+    if any(x in t for x in ["pay", "send ₹", "send rs", "transfer", "debit", "payment"]):
+        # Stall + extract details without paying
+        return (
+            ask_once("pay_stall", "I can do it, but I need the beneficiary name shown on the payment request and the exact reason/message. What does it display?")
+            or "What beneficiary name shows on the payment request?"
+        )
 
+    # If link is present but not fully extracted, ask for full link / domain
+    if URL_REGEX.search(last_msg) and not intel["phishingLinks"]:
+        return (
+            ask_once("full_link", "Please paste the full link here exactly as received (including https://).")
+            or "Please paste the full link exactly as received."
+        )
+
+    # ---- Stage progression ----
+    stage = session["stage"]
+
+    # Stage: triage (confirm bank + reason + reference)
+    if stage == "triage":
+        q = ask_once("bank_name", "Which bank is this and which department? (KYC/Compliance/UPI/NetBanking)")
+        if q:
+            return q
+        q = ask_once("reason", "What’s the exact reason for blocking—KYC pending, suspicious activity, or something else?")
+        if q:
+            return q
+        q = ask_once("ref_id", "Do you have an official reference/ticket number for this case?")
+        if q:
+            return q
+        session["stage"] = "collect_payment"
+        stage = "collect_payment"
+
+    # Stage: collect payment identifiers (UPI, beneficiary, IFSC, account)
+    if stage == "collect_payment":
+        # If no UPI yet, ask for it (but only once)
+        if not intel["upiIds"]:
+            q = ask_once("ask_upi", "What’s the UPI ID / handle you want me to use? Please send it exactly (like name@bank).")
+            if q:
+                return q
+
+        # If UPI exists but no beneficiary name asked yet, ask for name
+        q = ask_once("beneficiary_name", "What is the beneficiary/merchant name that will appear when I enter that UPI?")
+        if q:
+            return q
+
+        # If no link asked yet, ask for official payment page link
+        if not intel["phishingLinks"]:
+            q = ask_once("payment_link", "Is there an official payment/verification link from the bank? Please paste it here.")
+            if q:
+                return q
+
+        # Ask for bank account + IFSC only if they try alternate payment route
+        q = ask_once("acct_ifsc", "If UPI fails, do you have a bank account + IFSC option? Share the account number + IFSC.")
+        if q:
+            return q
+
+        session["stage"] = "stall_and_extend"
+        stage = "stall_and_extend"
+
+    # Stage: stall & extend (keep them engaged without exposing)
+    if stage == "stall_and_extend":
+        # Rotate among a few believable stalling questions
+        for key, text in [
+            ("doc_needed", "Before I proceed, can you send the exact SMS/email text you received from the bank (word to word)?"),
+            ("time_window", "By what time exactly will it be blocked? I’m currently not near my banking app."),
+            ("contact_details", "What’s your official helpline number and case reference? I’ll call back to confirm."),
+            ("location", "Which branch/city is handling this? My account is from a different city."),
+        ]:
+            q = ask_once(key, text)
+            if q:
+                return q
+
+        # Fallback
+        return "Okay, please share the official link and beneficiary details again so I can verify properly."
+
+    # Default fallback (should not hit often)
+    return "Can you share the official reference number and the exact steps again?"
+
+# ----------- Finalization -----------
 def should_finalize(session: Dict[str, Any]) -> bool:
     intel = session["intel"]
-    if session["turns"] >= 18:
+
+    has_any = (
+        bool(intel["upiIds"]) or bool(intel["phishingLinks"]) or bool(intel["phoneNumbers"]) or bool(intel["bankAccounts"]) or bool(intel["ifscCodes"])
+    )
+
+    # Finalize after enough engagement or enough intel
+    if session["total_messages"] >= 18:
         return True
-    if any(intel[k] for k in intel) and session["turns"] >= 6:
+    if has_any and session["total_messages"] >= 8:
         return True
     return False
 
@@ -100,15 +192,21 @@ def send_callback(session_id: str, session: Dict[str, Any]) -> None:
     if session.get("callback_sent"):
         return
 
+    intel = session["intel"]
+    extracted = {
+        "bankAccounts": intel["bankAccounts"],
+        "upiIds": intel["upiIds"],
+        "phishingLinks": intel["phishingLinks"],
+        "phoneNumbers": intel["phoneNumbers"],
+        "suspiciousKeywords": session["keywords"],
+    }
+
     payload = {
         "sessionId": session_id,
         "scamDetected": True,
-        "totalMessagesExchanged": session["turns"],
-        "extractedIntelligence": {
-            **session["intel"],
-            "suspiciousKeywords": session["keywords"],
-        },
-        "agentNotes": "Urgency and verification scam pattern detected",
+        "totalMessagesExchanged": session["total_messages"],
+        "extractedIntelligence": extracted,
+        "agentNotes": session.get("notes", "Urgency + verification scam pattern. Agent engaged to extract payment identifiers and links."),
     }
 
     try:
@@ -118,6 +216,7 @@ def send_callback(session_id: str, session: Dict[str, Any]) -> None:
         # Do not crash API if callback fails
         pass
 
+# ----------- Routes -----------
 @APP.get("/health")
 def health():
     return {"status": "ok"}
@@ -131,38 +230,51 @@ async def honeypot(req: HoneyPotRequest, x_api_key: str = Header(default="")):
 
     async with SESSION_LOCK:
         session = SESSIONS.setdefault(req.sessionId, {
-            "turns": 0,
             "scam": False,
-            "intel": {"bankAccounts": [], "upiIds": [], "phishingLinks": [], "phoneNumbers": []},
+            "intel": {"bankAccounts": [], "upiIds": [], "phishingLinks": [], "phoneNumbers": [], "ifscCodes": []},
             "keywords": [],
             "callback_sent": False,
+            "stage": "triage",
+            "asked": set(),
+            "total_messages": 0,   # counts both sides for scoring
+            "notes": "",
         })
 
-        session["turns"] += 1
+        # Count incoming message
+        session["total_messages"] += 1
 
-        # Extract intelligence from latest message
+        # Extract from latest incoming
         intel = extract_intel(req.message.text)
         for k in session["intel"]:
-            session["intel"][k] = list(set(session["intel"][k] + intel[k]))
+            if k in intel:
+                session["intel"][k] = list(set(session["intel"][k] + intel[k]))
 
         # Track suspicious keywords
-        t = req.message.text.lower()
+        msg_lower = req.message.text.lower()
         for kw in KEYWORDS:
-            if kw in t:
+            if kw in msg_lower:
                 session["keywords"].append(kw)
         session["keywords"] = list(set(session["keywords"]))
 
         # Detect scam
         if not session["scam"] and is_scam(req.message.text):
             session["scam"] = True
+            session["notes"] = "Scam intent detected; switched to agentic engagement to extract identifiers."
 
-        reply = agent_reply(session["turns"], req.message.text)
+        # If not scam yet, stay neutral (don’t expose)
+        if not session["scam"]:
+            reply = "Sorry, I didn’t understand. Can you explain what you need?"
+            session["total_messages"] += 1
+            return HoneyPotResponse(status="success", reply=reply)
 
-        # Count agent reply as another exchanged message (for scoring)
-        session["turns"] += 1
+        # Agent reply (stateful)
+        reply = next_agent_reply(session, req.message.text)
 
-        # Final callback if done
-        if session["scam"] and should_finalize(session):
+        # Count outgoing agent message
+        session["total_messages"] += 1
+
+        # Callback if done
+        if should_finalize(session):
             send_callback(req.sessionId, session)
 
     return HoneyPotResponse(status="success", reply=reply)
