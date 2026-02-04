@@ -127,7 +127,7 @@ def next_agent_reply(session: Dict[str, Any], last_msg: str) -> str:
         )
 
     # If scammer pushes payment/transfer
-    if any(x in t for x in ["pay", "transfer", "payment", "debit", "send rs", "send ₹", "freeze", "frozen"]):
+    if session["stage"] == "collect_intel" and any(x in t for x in ["pay", "transfer", "payment", "debit", "send rs", "send ₹", "freeze", "frozen"]):
         session["expecting"] = "beneficiary"
         return (
             ask_once(
