@@ -7,7 +7,7 @@ import requests
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field, ValidationError
 
-APP = FastAPI(title="Agentic HoneyPot API", version="1.0.0")
+APP = FastAPI(title="Agentic HoneyPot API", version="1.0.1")
 
 API_KEY = os.getenv("HONEYPOT_API_KEY", "")
 GUVI_CALLBACK_URL = "https://hackathon.guvi.in/api/updateHoneyPotFinalResult"
@@ -43,7 +43,6 @@ PHONE_REGEX = re.compile(r"\b(\+91[\s-]?)?[6-9]\d{9}\b")
 IFSC_REGEX = re.compile(r"\b[A-Z]{4}0[A-Z0-9]{6}\b", re.IGNORECASE)
 
 # Bank accounts: safer extraction using context words
-# e.g. "account number 12345678901", "a/c: 1234567890"
 BANK_CTX_REGEX = re.compile(
     r"(?:account(?:\s*number)?|acct|a/c|ac(?:\s*no)?|acc(?:\s*no)?)\s*[:\-]?\s*(\d{9,18})",
     re.IGNORECASE
@@ -90,15 +89,8 @@ def is_scam(text: str) -> bool:
 def extract_intel(text: str) -> Dict[str, List[str]]:
     upis = set(UPI_REGEX.findall(text))
     links = set(URL_REGEX.findall(text))
-    phones = set(PHONE_REGEX.findall(text))
-    # PHONE_REGEX with group returns tuples sometimes; normalize
-    normalized_phones = set()
-    for p in phones:
-        if isinstance(p, tuple):
-            # group behavior: first group might be "+91" etc; rebuild by re-finditer to be safe
-            pass
-    normalized_phones = set(m.group(0) for m in PHONE_REGEX.finditer(text))
 
+    normalized_phones = set(m.group(0) for m in PHONE_REGEX.finditer(text))
     bank_accounts = set(m.group(1) for m in BANK_CTX_REGEX.finditer(text))
     ifsc = set(IFSC_REGEX.findall(text))
 
@@ -146,13 +138,11 @@ def next_agent_reply(session: Dict[str, Any], last_msg: str) -> str:
         )
 
     # ---------- Self-correction: if we expected something and didn’t get it ----------
-    # If we asked for UPI earlier but still none found after a couple turns, re-ask differently.
     if expect == "upi" and not intel["upiIds"]:
         session["miss_counts"]["upi"] += 1
         if session["miss_counts"]["upi"] == 1:
             return "I’m not seeing the UPI handle. Please send it exactly like name@bank (no spaces)."
         if session["miss_counts"]["upi"] >= 2:
-            # switch tactic to link/phone
             session["expecting"] = "phone"
             return "Okay. If you can’t share UPI, which number should I call back to confirm this request?"
 
@@ -194,7 +184,6 @@ def next_agent_reply(session: Dict[str, Any], last_msg: str) -> str:
 
     # Stage 2: collect intel (actively request missing items)
     if stage == "collect_intel":
-        # Prefer collecting link first if none
         if not intel["phishingLinks"]:
             session["expecting"] = "link"
             q = ask_once("ask_link", "Please share the official verification link you received (paste the full URL).")
@@ -213,7 +202,6 @@ def next_agent_reply(session: Dict[str, Any], last_msg: str) -> str:
             if q:
                 return q
 
-        # Ask for bank acct only if they mention bank transfer or if IFSC present
         if not intel["bankAccounts"]:
             session["expecting"] = "bank"
             q = ask_once("ask_bank", "If it’s not UPI, share the account number and IFSC (for verification).")
@@ -253,7 +241,6 @@ def should_finalize(session: Dict[str, Any]) -> bool:
     if intel["bankAccounts"] or intel["ifscCodes"]:
         categories += 1
 
-    # finalize after deep engagement OR enough intel
     if session["total_messages"] >= 18:
         return True
     if categories >= 2 and session["total_messages"] >= 10:
@@ -262,10 +249,7 @@ def should_finalize(session: Dict[str, Any]) -> bool:
 
 def send_callback(session_id: str, session: Dict[str, Any]) -> None:
     if session.get("callback_sent"):
-        return HoneyPotResponse(
-            status="success",
-            reply="Thanks. I’m checking with the bank now."
-    )
+        return
 
     intel = session["intel"]
     payload = {
@@ -289,7 +273,6 @@ def send_callback(session_id: str, session: Dict[str, Any]) -> None:
         requests.post(GUVI_CALLBACK_URL, json=payload, timeout=5)
         session["callback_sent"] = True
     except Exception:
-        # don't crash
         pass
 
 # ---------------- Routes ----------------
@@ -349,6 +332,10 @@ async def honeypot(request: Request, x_api_key: str = Header(default="")):
             "miss_counts": {"upi": 0, "link": 0, "phone": 0},
         })
 
+        # 🚫 Conversation already finalized
+        if session.get("callback_sent"):
+            return HoneyPotResponse(status="success", reply="Thanks. I’m checking with the bank now.")
+
         # count incoming
         session["total_messages"] += 1
 
@@ -379,15 +366,13 @@ async def honeypot(request: Request, x_api_key: str = Header(default="")):
         reply = next_agent_reply(session, req.message.text)
         session["total_messages"] += 1
 
-        # callback when done
+        # callback when done (FINAL step)
         if should_finalize(session):
-    	   send_callback(req.sessionId, session)
-    	return HoneyPotResponse(
-          status="success",
-          reply="Thanks. I’ll verify this with my bank and get back if needed."
-    )
-
-            
+            send_callback(req.sessionId, session)
+            return HoneyPotResponse(
+                status="success",
+                reply="Thanks. I’ll verify this with my bank and get back if needed."
+            )
 
         # IMPORTANT: match guideline response format (status + reply only)
         return HoneyPotResponse(status="success", reply=reply)
