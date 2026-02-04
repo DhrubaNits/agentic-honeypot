@@ -268,12 +268,15 @@ def send_callback(session_id: str, session: Dict[str, Any]) -> None:
             "Scammer used urgency/verification tactics. Agent engaged to extract UPI/link/phone/bank details."
         ),
     }
+    print(f"[CALLBACK] Sending payload to GUVI for session {session_id}")
+    print(payload)
 
     try:
-        requests.post(GUVI_CALLBACK_URL, json=payload, timeout=5)
+        resp = requests.post(GUVI_CALLBACK_URL, json=payload, timeout=5)
+        print(f"[CALLBACK] GUVI response status: {resp.status_code}")
         session["callback_sent"] = True
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[CALLBACK ERROR] {e}")
 
 # ---------------- Routes ----------------
 @APP.get("/")
