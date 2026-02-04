@@ -7,7 +7,7 @@ import requests
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field, ValidationError
 
-APP = FastAPI(title="Agentic HoneyPot API", version="0.3.2")
+APP = FastAPI(title="Agentic HoneyPot API", version="0.4.0")
 
 API_KEY = os.getenv("HONEYPOT_API_KEY", "")
 GUVI_CALLBACK_URL = "https://hackathon.guvi.in/api/updateHoneyPotFinalResult"
@@ -15,12 +15,11 @@ GUVI_CALLBACK_URL = "https://hackathon.guvi.in/api/updateHoneyPotFinalResult"
 SESSIONS: Dict[str, Dict[str, Any]] = {}
 SESSION_LOCK = asyncio.Lock()
 
-# ----------- Models -----------
+# ----------- Models (request schema only; response is strict) -----------
 class Message(BaseModel):
     sender: str
     text: str
-    # Guideline says epoch ms; accept both int and str to be robust
-    timestamp: Union[int, str]
+    timestamp: Union[int, str]  # epoch ms or string
 
 class Metadata(BaseModel):
     channel: Optional[str] = None
@@ -36,16 +35,12 @@ class HoneyPotRequest(BaseModel):
 class HoneyPotResponse(BaseModel):
     status: str
     reply: str
-    # Optional extra fields (won't break evaluators expecting only status/reply)
-    scamDetected: Optional[bool] = None
-    totalMessagesExchanged: Optional[int] = None
-    extractedIntelligence: Optional[Dict[str, Any]] = None
 
 # ----------- Regex -----------
 UPI_REGEX = re.compile(r"\b[a-zA-Z0-9.\-_]{2,}@[a-zA-Z]{2,}\b")
 URL_REGEX = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 PHONE_REGEX = re.compile(r"\b(\+91[\s-]?)?[6-9]\d{9}\b")
-BANK_REGEX = re.compile(r"\b\d{9,18}\b")  # may catch amounts too; acceptable for MVP
+BANK_REGEX = re.compile(r"\b\d{9,18}\b")
 IFSC_REGEX = re.compile(r"\b[A-Z]{4}0[A-Z0-9]{6}\b", re.IGNORECASE)
 
 KEYWORDS = [
@@ -56,9 +51,9 @@ KEYWORDS = [
 
 # ----------- GUVI tester body detection -----------
 def is_guvi_tester_payload(body: Any) -> bool:
-    # GUVI endpoint tester sends apiUrl/apiKey/hackathonId/authToken, not sessionId/message
     return isinstance(body, dict) and (
-        "apiUrl" in body or "apiKey" in body or "hackathonId" in body or "requestedFrom" in body or "authToken" in body
+        "apiUrl" in body or "apiKey" in body or "hackathonId" in body
+        or "requestedFrom" in body or "authToken" in body
     )
 
 # ----------- Detection -----------
@@ -174,7 +169,6 @@ def next_agent_reply(session: Dict[str, Any], last_msg: str) -> str:
             q = ask_once(key, text)
             if q:
                 return q
-
         return "Okay, please share the official link and beneficiary details again so I can verify properly."
 
     return "Can you share the official reference number and the exact steps again?"
@@ -193,6 +187,7 @@ def should_finalize(session: Dict[str, Any]) -> bool:
     if intel["bankAccounts"] or intel["ifscCodes"]:
         categories += 1
 
+    # Finalize after enough engagement or enough intel
     if session["total_messages"] >= 18:
         return True
     if categories >= 2 and session["total_messages"] >= 10:
@@ -224,11 +219,12 @@ def send_callback(session_id: str, session: Dict[str, Any]) -> None:
     }
 
     try:
-        requests.post(GUVI_CALLBACK_URL, json=payload, timeout=5)
+        resp = requests.post(GUVI_CALLBACK_URL, json=payload, timeout=5)
+        # minimal logging (Render logs)
+        print(f"[CALLBACK] session={session_id} status={resp.status_code}")
         session["callback_sent"] = True
-    except Exception:
-        # don't crash if callback fails
-        pass
+    except Exception as e:
+        print(f"[CALLBACK] session={session_id} failed: {e}")
 
 # ----------- Routes -----------
 @APP.get("/")
@@ -239,7 +235,6 @@ def root():
 def health():
     return {"status": "ok"}
 
-# Some testers call GET /honeypot
 @APP.get("/honeypot", response_model=HoneyPotResponse)
 async def honeypot_get(x_api_key: str = Header(default="")):
     if not API_KEY:
@@ -261,21 +256,18 @@ async def honeypot(request: Request, x_api_key: str = Header(default="")):
     except Exception:
         body = None
 
-    # ✅ GUVI Endpoint Tester compatibility: it may send a tester payload (apiUrl/hackathonId/etc.)
+    # GUVI endpoint tester payload / unknown payload => return success
     if is_guvi_tester_payload(body):
         return HoneyPotResponse(status="success", reply="Honeypot endpoint reachable and secured.")
 
-    # ✅ If body doesn't look like honeypot schema, don't 422
     if not isinstance(body, dict) or "sessionId" not in body or "message" not in body:
         return HoneyPotResponse(status="success", reply="Honeypot endpoint reachable and secured.")
 
-    # Validate real honeypot payload
     try:
         req = HoneyPotRequest(**body)
     except ValidationError:
         return HoneyPotResponse(status="success", reply="Honeypot endpoint reachable and secured.")
 
-    # ---------------- REAL HONEYPOT LOGIC ----------------
     async with SESSION_LOCK:
         session = SESSIONS.setdefault(req.sessionId, {
             "scam": False,
@@ -284,59 +276,42 @@ async def honeypot(request: Request, x_api_key: str = Header(default="")):
             "callback_sent": False,
             "stage": "triage",
             "asked": set(),
-            "total_messages": 0,  # counts both sides
+            "total_messages": 0,
             "notes": "",
         })
 
-        # count incoming
+        # Count incoming
         session["total_messages"] += 1
 
-        # extract intel
+        # Extract intel from incoming message
         intel = extract_intel(req.message.text)
         for k in session["intel"]:
             session["intel"][k] = list(set(session["intel"][k] + intel.get(k, [])))
 
-        # keywords
+        # Track suspicious keywords
         msg_lower = req.message.text.lower()
         for kw in KEYWORDS:
             if kw in msg_lower:
                 session["keywords"].append(kw)
         session["keywords"] = list(set(session["keywords"]))
 
-        # scam detect
+        # Scam detection
         if not session["scam"] and is_scam(req.message.text):
             session["scam"] = True
             session["notes"] = "Scam intent detected; switched to agentic engagement to extract identifiers."
 
-        # neutral if not scam
+        # If not scam yet, stay neutral
         if not session["scam"]:
             reply = "Can you explain what you need?"
             session["total_messages"] += 1
-            return HoneyPotResponse(
-                status="success",
-                reply=reply,
-                scamDetected=False,
-                totalMessagesExchanged=session["total_messages"],
-            )
+            return HoneyPotResponse(status="success", reply=reply)
 
-        # agent reply
+        # Agent reply
         reply = next_agent_reply(session, req.message.text)
         session["total_messages"] += 1
 
-        # callback if finalized
+        # Send callback when done
         if should_finalize(session):
             send_callback(req.sessionId, session)
 
-        return HoneyPotResponse(
-            status="success",
-            reply=reply,
-            scamDetected=True,
-            totalMessagesExchanged=session["total_messages"],
-            extractedIntelligence={
-                "bankAccounts": session["intel"]["bankAccounts"],
-                "upiIds": session["intel"]["upiIds"],
-                "phishingLinks": session["intel"]["phishingLinks"],
-                "phoneNumbers": session["intel"]["phoneNumbers"],
-                "suspiciousKeywords": session["keywords"],
-            },
-        )
+        return HoneyPotResponse(status="success", reply=reply)
