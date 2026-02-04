@@ -262,7 +262,10 @@ def should_finalize(session: Dict[str, Any]) -> bool:
 
 def send_callback(session_id: str, session: Dict[str, Any]) -> None:
     if session.get("callback_sent"):
-        return
+        return HoneyPotResponse(
+            status="success",
+            reply="Thanks. I’m checking with the bank now."
+    )
 
     intel = session["intel"]
     payload = {
@@ -378,7 +381,13 @@ async def honeypot(request: Request, x_api_key: str = Header(default="")):
 
         # callback when done
         if should_finalize(session):
-            send_callback(req.sessionId, session)
+    	   send_callback(req.sessionId, session)
+    	return HoneyPotResponse(
+          status="success",
+          reply="Thanks. I’ll verify this with my bank and get back if needed."
+    )
+
+            
 
         # IMPORTANT: match guideline response format (status + reply only)
         return HoneyPotResponse(status="success", reply=reply)
