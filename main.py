@@ -1,13 +1,15 @@
 import os
 import re
 import asyncio
+import random
+import string
 from typing import Dict, Any, List, Optional, Union
 
 import requests
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field, ValidationError
 
-APP = FastAPI(title="Agentic HoneyPot API", version="1.0.1")
+APP = FastAPI(title="Agentic HoneyPot API", version="1.1.0")
 
 API_KEY = os.getenv("HONEYPOT_API_KEY", "")
 GUVI_CALLBACK_URL = "https://hackathon.guvi.in/api/updateHoneyPotFinalResult"
@@ -21,10 +23,12 @@ class Message(BaseModel):
     text: str
     timestamp: Union[int, str]  # guideline says epoch ms; accept both
 
+
 class Metadata(BaseModel):
     channel: Optional[str] = None
     language: Optional[str] = None
     locale: Optional[str] = None
+
 
 class HoneyPotRequest(BaseModel):
     sessionId: str
@@ -32,19 +36,27 @@ class HoneyPotRequest(BaseModel):
     conversationHistory: List[Message] = Field(default_factory=list)
     metadata: Optional[Metadata] = None
 
+
 class HoneyPotResponse(BaseModel):
     status: str
     reply: str
 
+
 # ---------------- Regex ----------------
 UPI_REGEX = re.compile(r"\b[a-zA-Z0-9.\-_]{2,}@[a-zA-Z]{2,}\b")
 URL_REGEX = re.compile(r"https?://[^\s]+", re.IGNORECASE)
-PHONE_REGEX = re.compile(r"\b(\+91[\s-]?)?[6-9]\d{9}\b")
+
+# Mobile numbers (India)
+PHONE_REGEX = re.compile(r"\b(?:\+91[\s-]?)?[6-9]\d{9}\b")
+
+# Toll-free / landline-ish patterns (captures 1800-xxx-xxxx)
+TOLL_FREE_REGEX = re.compile(r"\b1800[\s-]?\d{3}[\s-]?\d{4}\b")
+
 IFSC_REGEX = re.compile(r"\b[A-Z]{4}0[A-Z0-9]{6}\b", re.IGNORECASE)
 
-# Bank accounts: safer extraction using context words
+# Bank accounts: expanded to include "Account No.", "Acc No.", "A/c No."
 BANK_CTX_REGEX = re.compile(
-    r"(?:account(?:\s*number)?|acct|a/c|ac(?:\s*no)?|acc(?:\s*no)?)\s*[:\-]?\s*(\d{9,18})",
+    r"(?:account(?:\s*number)?|account\s*no\.?|acct|acct\s*no\.?|a/c|a/c\s*no\.?|ac(?:\s*no\.?)?|acc(?:\s*no\.?)?)\s*[:\-]?\s*(\d{9,18})",
     re.IGNORECASE
 )
 
@@ -53,6 +65,38 @@ KEYWORDS = [
     "upi", "refund", "click", "bank", "kyc", "account",
     "freeze", "limited", "penalty", "immediately", "compromised"
 ]
+
+# ---------------- Human tone helpers ----------------
+EMO_NEUTRAL = ["Okay.", "Hmm.", "Alright.", "Got it.", "Wait a second.", "Just a moment."]
+EMO_WORRIED = ["Oh no…", "That’s scary…", "I’m really worried now…", "This is stressing me out…", "Ugh…"]
+EMO_POLITE = ["Sorry, one second.", "Please help me understand.", "Just to be sure,", "One quick thing—"]
+
+def humanize(prefixes: List[str], core: str) -> str:
+    return f"{random.choice(prefixes)} {core}".strip()
+
+FINAL_HOLD_LINES = [
+    "Okay… I’m checking this with my bank right now.",
+    "Alright, I’m verifying. Give me a minute.",
+    "Noted. I’m on it — checking with the bank now.",
+    "Okay, I’m confirming this on my side. Please hold on.",
+]
+
+# ---------------- Text sanitization helpers ----------------
+def sanitize_text(text: str) -> str:
+    if not text:
+        return ""
+    t = text
+    # remove markdown-ish noise
+    t = t.replace("**", " ").replace("`", " ").replace("\u200b", "")
+    # normalize common obfuscations
+    t = t.replace("[.]", ".").replace("(.)", ".")
+    t = t.replace("[dot]", ".").replace("(dot)", ".")
+    # squeeze whitespace
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+def strip_trailing_punct(s: str) -> str:
+    return s.strip().strip(string.punctuation + "”’“‘*")
 
 # ---------------- GUVI tester detection ----------------
 def is_guvi_tester_payload(body: Any) -> bool:
@@ -63,6 +107,7 @@ def is_guvi_tester_payload(body: Any) -> bool:
 
 # ---------------- Detection ----------------
 def is_scam(text: str) -> bool:
+    text = sanitize_text(text)
     score = 0
     t = text.lower()
 
@@ -70,9 +115,9 @@ def is_scam(text: str) -> bool:
         score += 3
     if UPI_REGEX.search(text):
         score += 3
-    if PHONE_REGEX.search(text):
+    if PHONE_REGEX.search(text) or TOLL_FREE_REGEX.search(text):
         score += 1
-    if "otp" in t:
+    if "otp" in t or "upi pin" in t or "pin" in t:
         score += 3
 
     # Contextual bank account mention boosts score
@@ -87,24 +132,32 @@ def is_scam(text: str) -> bool:
 
 # ---------------- Intelligence extraction ----------------
 def extract_intel(text: str) -> Dict[str, List[str]]:
-    upis = set(UPI_REGEX.findall(text))
-    links = set(URL_REGEX.findall(text))
+    t = sanitize_text(text)
 
-    normalized_phones = set(m.group(0) for m in PHONE_REGEX.finditer(text))
-    bank_accounts = set(m.group(1) for m in BANK_CTX_REGEX.finditer(text))
-    ifsc = set(IFSC_REGEX.findall(text))
+    upis = set(m.group(0) for m in UPI_REGEX.finditer(t))
+    links = set(strip_trailing_punct(m.group(0)) for m in URL_REGEX.finditer(t))
+
+    phones = set(strip_trailing_punct(m.group(0)) for m in PHONE_REGEX.finditer(t))
+    tollfree = set(strip_trailing_punct(m.group(0)) for m in TOLL_FREE_REGEX.finditer(t))
+
+    bank_accounts = set(m.group(1) for m in BANK_CTX_REGEX.finditer(t))
+    ifsc = set(m.group(0) for m in IFSC_REGEX.finditer(t))
+
+    # merge phones + tollfree
+    all_phones = phones.union(tollfree)
 
     return {
-        "bankAccounts": list(bank_accounts),
-        "upiIds": list(upis),
-        "phishingLinks": list(links),
-        "phoneNumbers": list(normalized_phones),
-        "ifscCodes": list(ifsc),
+        "bankAccounts": sorted(bank_accounts),
+        "upiIds": sorted(upis),
+        "phishingLinks": sorted(links),
+        "phoneNumbers": sorted(all_phones),
+        "ifscCodes": sorted(ifsc),
     }
 
 # ---------------- Agent logic ----------------
 def next_agent_reply(session: Dict[str, Any], last_msg: str) -> str:
-    t = last_msg.lower()
+    last_msg_s = sanitize_text(last_msg)
+    t = last_msg_s.lower()
     intel = session["intel"]
     asked = session["asked"]
     expect = session["expecting"]  # what we are trying to get next (upi/link/phone/bank/ref)
@@ -115,96 +168,94 @@ def next_agent_reply(session: Dict[str, Any], last_msg: str) -> str:
         asked.add(key)
         return text
 
+    # If callback already sent, avoid repeating one robotic line
+    if session.get("callback_sent"):
+        return random.choice(FINAL_HOLD_LINES)
+
     # ----- safety (never share OTP / never pay) -----
-    if "otp" in t:
+    if "otp" in t or "upi pin" in t or ("pin" in t and "upi" in t):
         session["expecting"] = "support_ref"
-        return (
-            ask_once(
-                "otp_refuse",
-                "I can’t share OTP. Please provide an official bank support number or a complaint/ticket reference."
-            )
-            or "Please share the official support number or complaint/ticket reference."
-        )
+        core = "I can’t share OTP/UPI PIN over chat. Can you give me the official SBI helpline number and a complaint/ticket reference?"
+        return humanize(EMO_WORRIED, core)
 
     # If scammer pushes payment/transfer
-    if session["stage"] == "collect_intel" and any(x in t for x in ["pay", "transfer", "payment", "debit", "send rs", "send ₹", "freeze", "frozen"]):
+    if session["stage"] in ("collect_intel", "stall") and any(x in t for x in ["pay", "transfer", "payment", "debit", "send rs", "send ₹", "freeze", "frozen", "send 1"]):
         session["expecting"] = "beneficiary"
-        return (
-            ask_once(
-                "beneficiary",
-                "Before I proceed, what beneficiary/merchant name shows on the payment request? Also share the exact reason message."
-            )
-            or "What beneficiary/merchant name shows on the payment request?"
-        )
+        core = "Before I do anything, what beneficiary/merchant name shows on the payment request? Also what exact message are you seeing on your side?"
+        return humanize(EMO_NEUTRAL, core)
 
     # ---------- Self-correction: if we expected something and didn’t get it ----------
     if expect == "upi" and not intel["upiIds"]:
         session["miss_counts"]["upi"] += 1
         if session["miss_counts"]["upi"] == 1:
-            return "I’m not seeing the UPI handle. Please send it exactly like name@bank (no spaces)."
+            return humanize(EMO_POLITE, "I’m not seeing the UPI handle. Please send it exactly like name@bank (no spaces).")
         if session["miss_counts"]["upi"] >= 2:
             session["expecting"] = "phone"
-            return "Okay. If you can’t share UPI, which number should I call back to confirm this request?"
+            return humanize(EMO_NEUTRAL, "Okay, if you can’t share UPI, which number should I call back to confirm this request?")
 
     if expect == "link" and not intel["phishingLinks"]:
         session["miss_counts"]["link"] += 1
         if session["miss_counts"]["link"] == 1:
-            return "Please paste the full link exactly as received (including https://)."
+            return humanize(EMO_POLITE, "Please paste the full link exactly as received (including https://).")
         if session["miss_counts"]["link"] >= 2:
             session["expecting"] = "phone"
-            return "I didn’t receive the link. Share your official helpline number so I can confirm."
+            return humanize(EMO_NEUTRAL, "I didn’t receive the link. Share your official helpline number so I can confirm.")
 
     if expect == "phone" and not intel["phoneNumbers"]:
         session["miss_counts"]["phone"] += 1
         if session["miss_counts"]["phone"] == 1:
-            return "Which number should I call to confirm this? Please share the helpline/contact number."
+            return humanize(EMO_POLITE, "Which number should I call to confirm this? Please share the helpline/contact number.")
         if session["miss_counts"]["phone"] >= 2:
             session["expecting"] = "upi"
-            return "Okay, then share the UPI handle you want me to use (like name@bank)."
+            return humanize(EMO_NEUTRAL, "Okay, then share the UPI handle you want me to use (like name@bank).")
 
     # ---------- Stage-based flow ----------
     stage = session["stage"]
 
-    # Stage 1: triage
+    # Stage 1: triage (more human)
     if stage == "triage":
-        q = ask_once("bank_name", "Which bank is this and which department? (KYC/Compliance/UPI/NetBanking)")
+        q = ask_once("bank_name", humanize(EMO_POLITE, "This is SBI, right? Which department are you calling from—Cyber/UPI/KYC/NetBanking?"))
         if q:
             session["expecting"] = "bank"
             return q
-        q = ask_once("reason", "What’s the exact reason for blocking—KYC pending, suspicious activity, or something else?")
+
+        q = ask_once("reason", humanize(EMO_NEUTRAL, "What exactly triggered the block—suspicious activity, KYC pending, or some flagged transaction?"))
         if q:
             session["expecting"] = "reason"
             return q
-        q = ask_once("ref_id", "Do you have an official reference/ticket number for this case?")
+
+        q = ask_once("ref_id", humanize(EMO_POLITE, "Do you have a case ID / complaint reference for this?"))
         if q:
             session["expecting"] = "support_ref"
             return q
+
         session["stage"] = "collect_intel"
         stage = "collect_intel"
 
     # Stage 2: collect intel (actively request missing items)
     if stage == "collect_intel":
+        # prefer collecting link first if none
         if not intel["phishingLinks"]:
             session["expecting"] = "link"
-            q = ask_once("ask_link", "Please share the official verification link you received (paste the full URL).")
+            q = ask_once("ask_link", humanize(EMO_NEUTRAL, "Can you share the official verification link you received? Please paste the full URL."))
             if q:
                 return q
 
         if not intel["upiIds"]:
             session["expecting"] = "upi"
-            q = ask_once("ask_upi", "What’s the UPI ID / handle you want me to use? Please send it exactly (like name@bank).")
+            q = ask_once("ask_upi", humanize(EMO_POLITE, "What’s the UPI ID / handle you want me to use? Please send it exactly (like name@bank)."))
             if q:
                 return q
 
         if not intel["phoneNumbers"]:
             session["expecting"] = "phone"
-            q = ask_once("ask_phone", "Which number should I call back to confirm this request? Please share the contact number.")
+            q = ask_once("ask_phone", humanize(EMO_NEUTRAL, "Which number should I call back to confirm this request? Please share the contact number."))
             if q:
                 return q
 
         if not intel["bankAccounts"]:
             session["expecting"] = "bank"
-            q = ask_once("ask_bank", "If it’s not UPI, share the account number and IFSC (for verification).")
+            q = ask_once("ask_bank", humanize(EMO_POLITE, "If it’s not UPI, share the account number and IFSC (so I can verify)."))
             if q:
                 return q
 
@@ -213,38 +264,33 @@ def next_agent_reply(session: Dict[str, Any], last_msg: str) -> str:
 
     # Stage 3: stall and extend (believable + non-repetitive)
     if stage == "stall":
-        for key, text in [
-            ("time_window", "By what time exactly will it be blocked? I’m currently not near my banking app."),
-            ("message_copy", "Can you forward the exact SMS/email text you received from the bank (word to word)?"),
-            ("branch_city", "Which branch/city is handling this? My account is from a different city."),
-            ("confirm_again", "Just confirming—share the UPI/link again so I can verify before I do anything."),
+        for key, text_ in [
+            ("time_window", humanize(EMO_WORRIED, "By what time exactly will it be blocked? I’m stepping into a low-network area.")),
+            ("message_copy", humanize(EMO_NEUTRAL, "Can you paste the exact SMS/email text you received? Word to word.")),
+            ("branch_city", humanize(EMO_POLITE, "Which branch/city is handling this? My account is from a different city.")),
+            ("confirm_again", humanize(EMO_NEUTRAL, "Send the link/UPI again — I’ll try once I’m back on stable network.")),
         ]:
-            q = ask_once(key, text)
+            q = ask_once(key, text_)
             if q:
                 return q
 
-        return "Okay, share the link/UPI/contact details again so I can complete the verification."
+        return humanize(EMO_NEUTRAL, "Okay, share the link/UPI/contact details again so I can complete the verification.")
 
-    return "Can you share the official reference number and the exact steps again?"
+    return humanize(EMO_POLITE, "Can you share the official reference number and the exact steps again?")
 
 # ---------------- Finalization & Callback ----------------
 def should_finalize(session: Dict[str, Any]) -> bool:
     intel = session["intel"]
 
-    categories = 0
-    if intel["upiIds"]:
-        categories += 1
-    if intel["phishingLinks"]:
-        categories += 1
-    if intel["phoneNumbers"]:
-        categories += 1
-    if intel["bankAccounts"] or intel["ifscCodes"]:
-        categories += 1
-
+    # Prefer reaching 18 for scoring
     if session["total_messages"] >= 18:
         return True
-    if categories >= 2 and session["total_messages"] >= 10:
+
+    # Strong early finalize only if we have UPI + link + phone and enough turns
+    strong = bool(intel["upiIds"]) and bool(intel["phishingLinks"]) and bool(intel["phoneNumbers"])
+    if strong and session["total_messages"] >= 14:
         return True
+
     return False
 
 def send_callback(session_id: str, session: Dict[str, Any]) -> None:
@@ -268,6 +314,8 @@ def send_callback(session_id: str, session: Dict[str, Any]) -> None:
             "Scammer used urgency/verification tactics. Agent engaged to extract UPI/link/phone/bank details."
         ),
     }
+
+    # helpful logs
     print(f"[CALLBACK] Sending payload to GUVI for session {session_id}")
     print(payload)
 
@@ -335,25 +383,25 @@ async def honeypot(request: Request, x_api_key: str = Header(default="")):
             "miss_counts": {"upi": 0, "link": 0, "phone": 0},
         })
 
-        # 🚫 Conversation already finalized
+        # If already finalized, return a short human hold (not repetitive)
         if session.get("callback_sent"):
-            return HoneyPotResponse(status="success", reply="Thanks. I’m checking with the bank now.")
+            return HoneyPotResponse(status="success", reply=random.choice(FINAL_HOLD_LINES))
 
         # count incoming
         session["total_messages"] += 1
 
-        # extract intel
+        # extract intel (sanitized + improved)
         intel = extract_intel(req.message.text)
         for k, v in intel.items():
             if k in session["intel"]:
-                session["intel"][k] = list(set(session["intel"][k] + v))
+                session["intel"][k] = sorted(list(set(session["intel"][k] + v)))
 
         # keywords
-        msg_lower = req.message.text.lower()
+        msg_lower = sanitize_text(req.message.text).lower()
         for kw in KEYWORDS:
             if kw in msg_lower:
                 session["keywords"].append(kw)
-        session["keywords"] = list(set(session["keywords"]))
+        session["keywords"] = sorted(list(set(session["keywords"])))
 
         # detect scam
         if not session["scam"] and is_scam(req.message.text):
@@ -363,18 +411,23 @@ async def honeypot(request: Request, x_api_key: str = Header(default="")):
         # if not scam, stay neutral (don’t expose)
         if not session["scam"]:
             session["total_messages"] += 1
-            return HoneyPotResponse(status="success", reply="Can you explain what you need?")
+            return HoneyPotResponse(status="success", reply=humanize(EMO_POLITE, "Can you explain what you need?"))
 
-        # agent reply
+        # agent reply (more human + less repetitive)
         reply = next_agent_reply(session, req.message.text)
         session["total_messages"] += 1
 
         # callback when done (FINAL step)
         if should_finalize(session):
             send_callback(req.sessionId, session)
+            session["callback_sent"] = True
             return HoneyPotResponse(
                 status="success",
-                reply="Thanks. I’ll verify this with my bank and get back if needed."
+                reply=random.choice([
+                    "Okay, I’m going to check this with my bank now. If anything’s needed, I’ll come back to you.",
+                    "Alright… I’ll verify this with my bank and get back if needed.",
+                    "Noted. I’m confirming this with my bank right now.",
+                ])
             )
 
         # IMPORTANT: match guideline response format (status + reply only)
